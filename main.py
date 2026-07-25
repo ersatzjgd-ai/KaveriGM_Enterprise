@@ -52,7 +52,7 @@ UI_OPTIONS = ["Unassigned", "L1", "L2", "L3", "L4", "L5", "BR", "GMR"]
 SESSION_OPTIONS = ["VIP", "General", "Group", "Special Session"]
 STATUS_OPTIONS = ["Not yet", "Started", "Done"]
 
-# Table Column Configurations (externalized to prevent frontend JSON syntax errors)
+# Table Column Configurations
 incoming_table_cols = {
     "guest_name": {"title": "Name"}, 
     "session_type": {"title": "Session"}, 
@@ -89,6 +89,7 @@ pdf_path = ""
 # On-Ground Team Portal State
 active_guests = pd.DataFrame(columns=['guest_name', 'lounge_ui', 'lmw_status', 'demo_status'])
 selected_lounge_filter = "All"
+search_query = ""
 filter_options = ["All"] + UI_OPTIONS
 selected_active_index = -1
 active_guest_name = "Select a guest to manage"
@@ -191,11 +192,17 @@ def on_init(state):
 
 def refresh_data(state):
     inc, act = fetch_guests()
-    if state.selected_lounge_filter != "All":
-        act = act[act['lounge_ui'] == state.selected_lounge_filter].reset_index(drop=True)
     
-    state.incoming_guests = inc
-    state.active_guests = act
+    # Filter by Horizontal Button Selection
+    if state.selected_lounge_filter != "All":
+        act = act[act['lounge_ui'] == state.selected_lounge_filter]
+        
+    # Filter by Search Text
+    if state.search_query.strip():
+        act = act[act['guest_name'].str.contains(state.search_query.strip(), case=False, na=False)]
+    
+    state.incoming_guests = inc.reset_index(drop=True)
+    state.active_guests = act.reset_index(drop=True)
     notify(state, "info", "Dashboard refreshed.")
 
 def login_manager(state):
@@ -412,39 +419,53 @@ page_layout = """
 ## On-Ground Portal
 
 <|Refresh Dashboard|button|on_action=refresh_data|>
-Filter Station: <|{selected_lounge_filter}|selector|lov={filter_options}|dropdown=True|on_change=refresh_data|>
+<br/>
 
-### Active Guests
-*(Click a row to manage)*
+<|{selected_lounge_filter}|toggle|lov={filter_options}|on_change=refresh_data|>
+
+<br/>
+<|{search_query}|input|label=🔍 Search Guest Name...|on_change=refresh_data|width=100%|>
+<br/>
+
+*(Click a row below to open their management card)*
 <|{active_guests}|table|columns={active_table_cols}|on_action=select_active|>
 
 <hr/>
 
-#### Manage: **<|{active_guest_name}|text|>**
-<|layout|columns=1 1 1|
-<|part|
-**LMW Status**
-<|{active_lmw}|selector|lov={STATUS_OPTIONS}|>
-|>
-<|part|
-**IP Demo Status**
-<|{active_demo}|selector|lov={STATUS_OPTIONS}|>
-|>
-<|part|
-**Lounge**
-<|{active_lounge}|selector|lov={UI_OPTIONS}|dropdown=True|>
-|>
-|>
+<|part|render={active_guest_id != ""}|
+### 👤 <|{active_guest_name}|text|>
 
 <|layout|columns=1 1|
-<|{active_ready}|toggle|label=Ready to meet Gurudev|>
-<|{active_met}|toggle|label=Met Gurudev|>
+<|{active_lounge}|selector|lov={UI_OPTIONS}|dropdown=True|label=Lounge|>
+<|📸 Photo|button|>
 |>
 
 <br/>
-<|Save Updates|button|on_action=save_active_updates|>
-<|Generate WhatsApp Share Link|button|on_action=generate_wa_link|>
-<|Complete Visit (Archive)|button|on_action=complete_visit|>
+<|layout|columns=1 1|
+<|part|
+**📺 LMW**
+<|{active_lmw}|toggle|lov={STATUS_OPTIONS}|>
+|>
+<|part|
+**💻 IP Demo**
+<|{active_demo}|toggle|lov={STATUS_OPTIONS}|>
+|>
+|>
+
+<br/>
+<|layout|columns=1 1|
+<|{active_ready}|toggle|label=⏳ Ready for Vyas|>
+<|{active_met}|toggle|label=🤝 Met Gurudev|>
+|>
+
+<br/>
+<|layout|columns=1 1 1|
+<|📱 WhatsApp|button|on_action=generate_wa_link|>
+<|💾 Save Updates|button|on_action=save_active_updates|>
+<|✅ Complete|button|on_action=complete_visit|>
+|>
+|>
+
 |>
 """
 
@@ -456,6 +477,6 @@ if __name__ == "__main__":
     gui.run(
         host="0.0.0.0",
         port=PORT,
-        dark_mode=False,
+        dark_mode=True,  # Set to True to match the screenshot aesthetic
         title="Kaveri GM"
     )
