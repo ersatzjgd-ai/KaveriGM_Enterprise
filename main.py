@@ -24,28 +24,18 @@ TELEGRAM_GROUP_ID = os.getenv("TELEGRAM_GROUP_ID", "")
 MANAGER_PASSWORD = os.getenv("MANAGER_PASSWORD", "kaveri_admin")
 PORT = int(os.environ.get("PORT", 8080))
 
-# Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ==========================================
 # 2. DOMAIN LOGIC & MAPPINGS
 # ==========================================
 ZONES_DB_TO_UI = {
-    "reception": "Unassigned", 
-    "lounge1": "L1", 
-    "lounge2": "L2", 
-    "lounge3": "L3", 
-    "lounge4": "L4", 
-    "lounge5": "L5", 
-    "br": "BR", 
-    "gmr": "GMR", 
-    "passageway_top": "Top Hallway",
-    "passageway_right_a": "Right Hallway A", 
-    "passageway_right_b": "Right Hallway B",
-    None: "Unassigned", 
-    "": "Unassigned"
+    "reception": "Unassigned", "lounge1": "L1", "lounge2": "L2", 
+    "lounge3": "L3", "lounge4": "L4", "lounge5": "L5", 
+    "br": "BR", "gmr": "GMR", "passageway_top": "Top Hallway",
+    "passageway_right_a": "Right Hallway A", "passageway_right_b": "Right Hallway B",
+    None: "Unassigned", "": "Unassigned"
 }
-
 ZONES_UI_TO_DB = {v: k for k, v in ZONES_DB_TO_UI.items() if k not in [None, ""]}
 ZONES_UI_TO_DB["Unassigned"] = "reception"
 
@@ -53,19 +43,8 @@ UI_OPTIONS = ["Unassigned", "L1", "L2", "L3", "L4", "L5", "BR", "GMR"]
 SESSION_OPTIONS = ["VIP", "General", "Group", "Special Session"]
 STATUS_OPTIONS = ["Not yet", "Started", "Done"]
 
-# Table Column Configurations
-incoming_table_cols = {
-    "guest_name": {"title": "Name"}, 
-    "session_type": {"title": "Session"}, 
-    "lounge_ui": {"title": "Lounge"}
-}
-
-active_table_cols = {
-    "guest_name": {"title": "Name"}, 
-    "lounge_ui": {"title": "Lounge"}, 
-    "lmw_status": {"title": "LMW"}, 
-    "demo_status": {"title": "Demo"}
-}
+incoming_table_cols = {"guest_name": {"title": "Name"}, "session_type": {"title": "Session"}, "lounge_ui": {"title": "Lounge"}}
+active_table_cols = {"guest_name": {"title": "Name"}, "lounge_ui": {"title": "Lounge"}, "lmw_status": {"title": "LMW"}, "demo_status": {"title": "Demo"}}
 
 # ==========================================
 # 3. TAIPY STATE VARIABLES
@@ -73,7 +52,6 @@ active_table_cols = {
 current_role = "On-Ground Team 🏃"
 roles = ["On-Ground Team 🏃", "Manager 👔"]
 
-# Manager Portal State
 manager_password_input = ""
 is_manager_authenticated = False
 new_guest_name = ""
@@ -87,7 +65,6 @@ camera_image = ""
 qr_data = ""
 pdf_path = ""
 
-# On-Ground Team Portal State
 active_guests = pd.DataFrame(columns=['guest_name', 'lounge_ui', 'lmw_status', 'demo_status'])
 selected_lounge_filter = "All"
 search_query = ""
@@ -102,61 +79,72 @@ active_met = False
 active_lounge = "Unassigned"
 
 # ==========================================
-# 4. DATABASE & EXTERNAL API HELPERS
+# 4. GLOBAL REAL-TIME SYNC REGISTRY
 # ==========================================
+active_clients = set()
+latest_inc = pd.DataFrame()
+latest_act = pd.DataFrame()
+last_data_hash = ""
+
 def fetch_guests():
-    """Fetches and categorizes today's guests from Supabase."""
+    """Queries DB and structures data safely."""
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     response = supabase.table('guests').select('*').gte('created_at', today).execute()
     
     df = pd.DataFrame(response.data)
     if df.empty:
-        empty_inc = pd.DataFrame(columns=['guest_name', 'session_type', 'lounge_ui'])
-        empty_act = pd.DataFrame(columns=['guest_name', 'lounge_ui', 'lmw_status', 'demo_status'])
-        return empty_inc, empty_act
+        return pd.DataFrame(columns=['guest_name', 'session_type', 'lounge_ui']), pd.DataFrame(columns=['guest_name', 'lounge_ui', 'lmw_status', 'demo_status'])
     
     df['is_active'] = df['is_active'].fillna(False)
     df['has_left_kaveri'] = df['has_left_kaveri'].fillna(False)
     df['jai_gurudev'] = df['jai_gurudev'].fillna(False)
     df['lounge_ui'] = df['lounge'].map(ZONES_DB_TO_UI).fillna("Unassigned")
     
-    incoming = df[(df['is_active'] == False) & (df['has_left_kaveri'] == False)].reset_index(drop=True)
-    active = df[(df['is_active'] == True) & (df['jai_gurudev'] == False)].reset_index(drop=True)
-    
-    return incoming, active
+    inc = df[(df['is_active'] == False) & (df['has_left_kaveri'] == False)].reset_index(drop=True)
+    act = df[(df['is_active'] == True) & (df['jai_gurudev'] == False)].reset_index(drop=True)
+    return inc, act
 
-def send_telegram_alert(guest_name, guest_id, lounge_ui, photo_path_or_b64=None):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_GROUP_ID:
-        return
-    url_base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-    keyboard = {
-        "inline_keyboard": [
-            [{"text": "L1", "callback_data": f"lng:{guest_id}:lounge1"}, {"text": "L2", "callback_data": f"lng:{guest_id}:lounge2"}, {"text": "L3", "callback_data": f"lng:{guest_id}:lounge3"}, {"text": "L4", "callback_data": f"lng:{guest_id}:lounge4"}],
-            [{"text": "L5", "callback_data": f"lng:{guest_id}:lounge5"}, {"text": "BR", "callback_data": f"lng:{guest_id}:br"}, {"text": "GMR", "callback_data": f"lng:{guest_id}:gmr"}]
-        ]
-    }
-    caption = f"🚨 <b>New Arrival</b>\n👤 <b>{guest_name}</b>\n📍 Lounge: <b>{lounge_ui}</b>\n\nPlease assign a lounge:"
-    try:
-        if photo_path_or_b64:
-            if os.path.exists(photo_path_or_b64):
-                with open(photo_path_or_b64, "rb") as f:
-                    requests.post(f"{url_base}/sendPhoto", data={"chat_id": TELEGRAM_GROUP_ID, "caption": caption, "parse_mode": "HTML", "reply_markup": str(keyboard)}, files={"photo": ("guest.jpg", f, "image/jpeg")})
-            else:
-                photo_bytes = base64.b64decode(photo_path_or_b64.split(",")[1] if "," in photo_path_or_b64 else photo_path_or_b64)
-                requests.post(f"{url_base}/sendPhoto", data={"chat_id": TELEGRAM_GROUP_ID, "caption": caption, "parse_mode": "HTML", "reply_markup": str(keyboard)}, files={"photo": ("guest.jpg", photo_bytes, "image/jpeg")})
-        else:
-            requests.post(f"{url_base}/sendMessage", json={"chat_id": TELEGRAM_GROUP_ID, "text": caption, "parse_mode": "HTML", "reply_markup": keyboard})
-    except Exception as e:
-        print(f"Telegram Error: {e}")
+def broadcast_update():
+    """Pushes the latest global data to ALL connected devices instantly."""
+    dead_clients = set()
+    for client_id in active_clients:
+        try:
+            invoke_callback(gui, client_id, silent_refresh)
+        except Exception:
+            dead_clients.add(client_id)
+    # Clean up disconnected devices
+    active_clients.difference_update(dead_clients)
 
-# ==========================================
-# 5. TAIPY EVENT CALLBACKS & SYNC LOGIC
-# ==========================================
-def silent_refresh(state):
-    """Fetches data and syncs the UI silently without triggering notifications."""
+def force_sync():
+    """Forces a DB fetch and triggers a global broadcast."""
+    global latest_inc, latest_act, last_data_hash
     inc, act = fetch_guests()
+    latest_inc = inc
+    latest_act = act
+    last_data_hash = hash(inc.to_csv() + act.to_csv())
+    broadcast_update()
+
+def global_db_watcher():
+    """Background thread polling Supabase for manual DB edits."""
+    global latest_inc, latest_act, last_data_hash
+    while True:
+        time.sleep(2.5)  # 2.5 seconds = 'Instant' feel for manual DB changes
+        try:
+            inc, act = fetch_guests()
+            current_hash = hash(inc.to_csv() + act.to_csv())
+            if current_hash != last_data_hash:
+                latest_inc = inc
+                latest_act = act
+                last_data_hash = current_hash
+                broadcast_update()
+        except Exception as e:
+            print(f"DB Watcher Error: {e}")
+
+def silent_refresh(state):
+    """Applies global data to the local client's state & active filters."""
+    inc = latest_inc.copy()
+    act = latest_act.copy()
     
-    # Apply filters
     if state.selected_lounge_filter != "All":
         act = act[act['lounge_ui'] == state.selected_lounge_filter]
     if state.search_query.strip():
@@ -165,7 +153,7 @@ def silent_refresh(state):
     state.incoming_guests = inc.reset_index(drop=True)
     state.active_guests = act.reset_index(drop=True)
 
-    # Sync the open guest card fields with the database instantly
+    # Instantly update the guest card if it's currently open
     if state.active_guest_id:
         current_guest = act[act['id'].astype(str) == state.active_guest_id]
         if not current_guest.empty:
@@ -176,32 +164,20 @@ def silent_refresh(state):
             state.active_met = bool(row.get('met_gurudev', False))
             state.active_lounge = row.get('lounge_ui', 'Unassigned')
         else:
-            # Guest was completed/deleted from DB manually
             state.active_guest_id = ""
             state.active_guest_name = "Select a guest to manage"
 
-def auto_refresh_loop(state_id):
-    """Background thread that triggers a silent UI refresh every 8 seconds."""
-    while True:
-        time.sleep(8)
-        try:
-            # Pushes updates from the background thread to the specific user's Taipy session
-            invoke_callback(gui, state_id, silent_refresh)
-        except Exception:
-            pass # Fails gracefully if user disconnects
-
+# ==========================================
+# 5. TAIPY EVENT CALLBACKS
+# ==========================================
 def on_init(state):
-    inc, act = fetch_guests()
-    state.incoming_guests = inc
-    state.active_guests = act
-    
-    # Start the auto-refresh background thread for this client session
-    state_id = get_state_id(state)
-    threading.Thread(target=auto_refresh_loop, args=(state_id,), daemon=True).start()
-
-def refresh_data(state):
+    # Register the new device/tab
+    client_id = get_state_id(state)
+    active_clients.add(client_id)
     silent_refresh(state)
-    notify(state, "info", "Dashboard refreshed.")
+
+def on_filter_change(state):
+    silent_refresh(state)
 
 def login_manager(state):
     if state.manager_password_input == MANAGER_PASSWORD:
@@ -216,9 +192,9 @@ def add_new_guest(state):
         return
     data = {"guest_name": state.new_guest_name, "session_type": state.new_guest_session, "is_active": False, "has_left_kaveri": False, "jai_gurudev": False, "lounge": "reception"}
     supabase.table('guests').insert(data).execute()
+    force_sync() # Instantly sync all devices
     notify(state, "success", f"Added {state.new_guest_name}!")
     state.new_guest_name = ""
-    refresh_data(state)
 
 def select_incoming(state, id, payload):
     index = payload["index"]
@@ -250,26 +226,31 @@ def check_in_guest(state):
         return
     db_lounge = ZONES_UI_TO_DB.get(state.checkin_lounge, "reception")
     update_data = {"is_active": True, "lounge": db_lounge}
-    
     if state.camera_image:
         update_data["photo_data"] = base64.b64encode(open(state.camera_image, "rb").read()).decode('utf-8') if os.path.exists(state.camera_image) else state.camera_image
 
     supabase.table('guests').update(update_data).eq('id', state.checkin_guest_id).execute()
-    send_telegram_alert(state.checkin_guest_name, state.checkin_guest_id, state.checkin_lounge, state.camera_image)
+    
+    # Telegram API Call extracted cleanly
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_GROUP_ID:
+        try:
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_GROUP_ID, "text": f"🚨 <b>New Arrival</b>\n👤 <b>{state.checkin_guest_name}</b>\n📍 Lounge: <b>{state.checkin_lounge}</b>", "parse_mode": "HTML"})
+        except Exception:
+            pass
+
+    force_sync() # Instantly sync all devices
     notify(state, "success", f"{state.checkin_guest_name} checked in!")
     state.checkin_guest_name = "Select a guest to check-in"
     state.checkin_guest_id = ""
     state.camera_image = ""
-    refresh_data(state)
 
 def generate_pdf(state):
-    _, act = fetch_guests()
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", size=12)
     pdf.cell(200, 10, txt=f"Kaveri GM - Daily Report ({datetime.now().strftime('%Y-%m-%d')})", ln=True, align='C')
-    for _, row in act.iterrows():
-        pdf.cell(200, 10, txt=f"Name: {row['guest_name']} | Lounge: {row['lounge_ui']} | LMW: {row.get('lmw_status', 'Not yet')} | Demo: {row.get('demo_status', 'Not yet')} | Met: {row.get('met_gurudev', False)}", ln=True)
+    for _, row in latest_act.iterrows():
+        pdf.cell(200, 10, txt=f"Name: {row['guest_name']} | Lounge: {row['lounge_ui']} | LMW: {row.get('lmw_status', 'Not yet')} | Met: {row.get('met_gurudev', False)}", ln=True)
     pdf.output("daily_report.pdf")
     state.pdf_path = "daily_report.pdf"
     notify(state, "success", "PDF Generated! Click download.")
@@ -288,30 +269,26 @@ def select_active(state, id, payload):
 
 def save_active_updates(state):
     if not state.active_guest_id:
-        notify(state, "warning", "No guest selected to update.")
         return
     db_lounge = ZONES_UI_TO_DB.get(state.active_lounge, "reception")
     data = {"lmw_status": state.active_lmw, "demo_status": state.active_demo, "ready_to_meet_gurudev": state.active_ready, "met_gurudev": state.active_met, "lounge": db_lounge}
     supabase.table('guests').update(data).eq('id', state.active_guest_id).execute()
+    force_sync() # Instantly sync all devices
     notify(state, "success", "Status updated!")
-    refresh_data(state)
 
 def complete_visit(state):
     if not state.active_guest_id:
-        notify(state, "warning", "No guest selected.")
         return
     supabase.table('guests').update({"jai_gurudev": True}).eq('id', state.active_guest_id).execute()
-    notify(state, "info", "Visit completed.")
     state.active_guest_name = "Select a guest to manage"
     state.active_guest_id = ""
-    refresh_data(state)
+    force_sync() # Instantly sync all devices
+    notify(state, "info", "Visit completed.")
 
 def generate_wa_link(state):
-    if not state.active_guest_name or state.active_guest_name == "Select a guest to manage":
-        notify(state, "warning", "Select a guest first.")
-        return
-    msg = f"Status Update: {state.active_guest_name}\nLounge: {state.active_lounge}\nLMW: {state.active_lmw}\nDemo: {state.active_demo}"
-    notify(state, "info", f"https://wa.me/?text={requests.utils.quote(msg)}")
+    if state.active_guest_id:
+        msg = f"Status Update: {state.active_guest_name}\nLounge: {state.active_lounge}\nLMW: {state.active_lmw}\nDemo: {state.active_demo}"
+        notify(state, "info", f"https://wa.me/?text={requests.utils.quote(msg)}")
 
 # ==========================================
 # 6. TAIPY GUI MARKDOWN LAYOUT
@@ -350,7 +327,7 @@ page_layout = """
 <|{camera_image}|image|height=200px|>
 |>
 <|part|
-<|Scan QR (from camera)|button|on_action=scan_qr|>
+<|Scan QR|button|on_action=scan_qr|>
 <|{qr_data}|text|>
 <br/>
 <|{checkin_lounge}|selector|lov={UI_OPTIONS}|dropdown=True|label=Assign Lounge|>
@@ -369,13 +346,9 @@ page_layout = """
 <|part|render={current_role == "On-Ground Team 🏃"}|
 ## On-Ground Portal
 
-<|Refresh Dashboard|button|on_action=refresh_data|>
+<|{selected_lounge_filter}|toggle|lov={filter_options}|on_change=on_filter_change|>
 <br/>
-
-<|{selected_lounge_filter}|toggle|lov={filter_options}|on_change=refresh_data|>
-
-<br/>
-<|{search_query}|input|label=🔍 Search Guest Name...|on_change=refresh_data|width=100%|>
+<|{search_query}|input|label=🔍 Search Guest Name...|on_change=on_filter_change|width=100%|>
 <br/>
 
 *(Click a row below to open their management card)*
@@ -425,6 +398,14 @@ page_layout = """
 # ==========================================
 if __name__ == "__main__":
     gui = Gui(page=page_layout)
+    
+    # 1. Fetch initial global state before boot
+    force_sync()
+    
+    # 2. Start background DB watcher thread
+    threading.Thread(target=global_db_watcher, daemon=True).start()
+    
+    # 3. Boot GUI
     gui.run(
         host="0.0.0.0",
         port=PORT,
