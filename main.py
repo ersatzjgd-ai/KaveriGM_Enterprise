@@ -50,6 +50,21 @@ STATUS_OPTIONS = ["Not yet", "Started", "Done"]
 current_role = "On-Ground Team 🏃"
 roles = ["On-Ground Team 🏃", "Manager 👔"]
 
+
+incoming_table_cols = {
+    "guest_name": {"title": "Name"}, 
+    "session_type": {"title": "Session"}, 
+    "lounge_ui": {"title": "Lounge"}
+}
+
+active_table_cols = {
+    "guest_name": {"title": "Name"}, 
+    "lounge_ui": {"title": "Lounge"}, 
+    "lmw_status": {"title": "LMW"}, 
+    "demo_status": {"title": "Demo"}
+}
+
+
 # Manager State
 manager_password_input = ""
 is_manager_authenticated = False
@@ -343,7 +358,7 @@ page_layout = """
 
 ### Incoming Guests 
 *(Click a row to check-in)*
-<|{incoming_guests}|table|columns={{"guest_name": {"title": "Name"}, "session_type": {"title": "Session"}, "lounge_ui": {"title": "Lounge"}}}|on_action=select_incoming|>
+<|{incoming_guests}|table|columns={incoming_table_cols}|on_action=select_incoming|>
 
 #### Check-in selected: **<|{checkin_guest_name}|text|>**
 <|layout|columns=1 1|
@@ -373,7 +388,7 @@ Filter Station: <|{selected_lounge_filter}|selector|lov={filter_options}|dropdow
 
 ### Active Guests
 *(Click a row to manage)*
-<|{active_guests}|table|columns={{"guest_name": {"title": "Name"}, "lounge_ui": {"title": "Lounge"}, "lmw_status": {"title": "LMW"}, "demo_status": {"title": "Demo"}}}|on_action=select_active|>
+<|{active_guests}|table|columns={active_table_cols}|on_action=select_active|>
 
 <hr/>
 
