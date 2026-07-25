@@ -23,18 +23,26 @@ TELEGRAM_GROUP_ID = os.getenv("TELEGRAM_GROUP_ID", "")
 MANAGER_PASSWORD = os.getenv("MANAGER_PASSWORD", "kaveri_admin")
 PORT = int(os.environ.get("PORT", 8080))
 
-# Initialize Supabase
+# Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ==========================================
 # 2. DOMAIN LOGIC & MAPPINGS
 # ==========================================
 ZONES_DB_TO_UI = {
-    "reception": "Unassigned", "lounge1": "L1", "lounge2": "L2", 
-    "lounge3": "L3", "lounge4": "L4", "lounge5": "L5", 
-    "br": "BR", "gmr": "GMR", "passageway_top": "Top Hallway",
-    "passageway_right_a": "Right Hallway A", "passageway_right_b": "Right Hallway B",
-    None: "Unassigned", "": "Unassigned"
+    "reception": "Unassigned", 
+    "lounge1": "L1", 
+    "lounge2": "L2", 
+    "lounge3": "L3", 
+    "lounge4": "L4", 
+    "lounge5": "L5", 
+    "br": "BR", 
+    "gmr": "GMR", 
+    "passageway_top": "Top Hallway",
+    "passageway_right_a": "Right Hallway A", 
+    "passageway_right_b": "Right Hallway B",
+    None: "Unassigned", 
+    "": "Unassigned"
 }
 
 ZONES_UI_TO_DB = {v: k for k, v in ZONES_DB_TO_UI.items() if k not in [None, ""]}
@@ -44,13 +52,7 @@ UI_OPTIONS = ["Unassigned", "L1", "L2", "L3", "L4", "L5", "BR", "GMR"]
 SESSION_OPTIONS = ["VIP", "General", "Group", "Special Session"]
 STATUS_OPTIONS = ["Not yet", "Started", "Done"]
 
-# ==========================================
-# 3. TAIPY STATE VARIABLES
-# ==========================================
-current_role = "On-Ground Team 🏃"
-roles = ["On-Ground Team 🏃", "Manager 👔"]
-
-
+# Table Column Configurations (externalized to prevent frontend JSON syntax errors)
 incoming_table_cols = {
     "guest_name": {"title": "Name"}, 
     "session_type": {"title": "Session"}, 
@@ -64,13 +66,18 @@ active_table_cols = {
     "demo_status": {"title": "Demo"}
 }
 
+# ==========================================
+# 3. TAIPY STATE VARIABLES
+# ==========================================
+current_role = "On-Ground Team 🏃"
+roles = ["On-Ground Team 🏃", "Manager 👔"]
 
-# Manager State
+# Manager Portal State
 manager_password_input = ""
 is_manager_authenticated = False
 new_guest_name = ""
 new_guest_session = "General"
-incoming_guests = pd.DataFrame()
+incoming_guests = pd.DataFrame(columns=['guest_name', 'session_type', 'lounge_ui'])
 selected_incoming_index = -1
 checkin_guest_name = "Select a guest to check-in"
 checkin_guest_id = ""
@@ -79,8 +86,8 @@ camera_image = ""
 qr_data = ""
 pdf_path = ""
 
-# On-Ground State
-active_guests = pd.DataFrame()
+# On-Ground Team Portal State
+active_guests = pd.DataFrame(columns=['guest_name', 'lounge_ui', 'lmw_status', 'demo_status'])
 selected_lounge_filter = "All"
 filter_options = ["All"] + UI_OPTIONS
 selected_active_index = -1
@@ -93,30 +100,33 @@ active_met = False
 active_lounge = "Unassigned"
 
 # ==========================================
-# 4. DATABASE HELPERS
+# 4. DATABASE & EXTERNAL API HELPERS
 # ==========================================
 def fetch_guests():
-    """Fetches and categorizes today's guests from Supabase."""
+    """Fetches and categorizes today's guests from Supabase with safe index resets."""
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     response = supabase.table('guests').select('*').gte('created_at', today).execute()
     
     df = pd.DataFrame(response.data)
     if df.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        empty_inc = pd.DataFrame(columns=['guest_name', 'session_type', 'lounge_ui'])
+        empty_act = pd.DataFrame(columns=['guest_name', 'lounge_ui', 'lmw_status', 'demo_status'])
+        return empty_inc, empty_act
     
-    # Map DB lounges to UI lounges
+    # Handle NULL database fields safely
+    df['is_active'] = df['is_active'].fillna(False)
+    df['has_left_kaveri'] = df['has_left_kaveri'].fillna(False)
+    df['jai_gurudev'] = df['jai_gurudev'].fillna(False)
     df['lounge_ui'] = df['lounge'].map(ZONES_DB_TO_UI).fillna("Unassigned")
     
-    # Filter incoming (not active, hasn't left)
-    incoming = df[(df['is_active'] == False) & (df['has_left_kaveri'] == False)]
-    
-    # Filter active (active, hasn't completed visit)
-    active = df[(df['is_active'] == True) & (df['jai_gurudev'] == False)]
+    # Filter incoming (not active, hasn't left) and active guests, ensuring index reset
+    incoming = df[(df['is_active'] == False) & (df['has_left_kaveri'] == False)].reset_index(drop=True)
+    active = df[(df['is_active'] == True) & (df['jai_gurudev'] == False)].reset_index(drop=True)
     
     return incoming, active
 
-def send_telegram_alert(guest_name, guest_id, lounge_ui, photo_b64=None):
-    """Sends check-in alert to Telegram with inline buttons for lounge assignment."""
+def send_telegram_alert(guest_name, guest_id, lounge_ui, photo_path_or_b64=None):
+    """Sends arrival notifications with quick assignment buttons to Telegram."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_GROUP_ID:
         return
 
@@ -146,14 +156,20 @@ def send_telegram_alert(guest_name, guest_id, lounge_ui, photo_b64=None):
     )
 
     try:
-        if photo_b64:
-            # Strip base64 header if present
-            if "," in photo_b64:
-                photo_b64 = photo_b64.split(",")[1]
-            photo_bytes = base64.b64decode(photo_b64)
-            files = {"photo": ("guest.jpg", photo_bytes, "image/jpeg")}
-            data = {"chat_id": TELEGRAM_GROUP_ID, "caption": caption, "parse_mode": "HTML", "reply_markup": str(keyboard)}
-            requests.post(f"{url_base}/sendPhoto", data=data, files=files)
+        if photo_path_or_b64:
+            if os.path.exists(photo_path_or_b64):
+                with open(photo_path_or_b64, "rb") as f:
+                    files = {"photo": ("guest.jpg", f, "image/jpeg")}
+                    data = {"chat_id": TELEGRAM_GROUP_ID, "caption": caption, "parse_mode": "HTML", "reply_markup": str(keyboard)}
+                    requests.post(f"{url_base}/sendPhoto", data=data, files=files)
+            else:
+                photo_b64 = photo_path_or_b64
+                if "," in photo_b64:
+                    photo_b64 = photo_b64.split(",")[1]
+                photo_bytes = base64.b64decode(photo_b64)
+                files = {"photo": ("guest.jpg", photo_bytes, "image/jpeg")}
+                data = {"chat_id": TELEGRAM_GROUP_ID, "caption": caption, "parse_mode": "HTML", "reply_markup": str(keyboard)}
+                requests.post(f"{url_base}/sendPhoto", data=data, files=files)
         else:
             payload = {
                 "chat_id": TELEGRAM_GROUP_ID,
@@ -166,7 +182,7 @@ def send_telegram_alert(guest_name, guest_id, lounge_ui, photo_b64=None):
         print(f"Telegram Error: {e}")
 
 # ==========================================
-# 5. TAIPY CALLBACKS
+# 5. TAIPY EVENT CALLBACKS
 # ==========================================
 def on_init(state):
     inc, act = fetch_guests()
@@ -176,7 +192,7 @@ def on_init(state):
 def refresh_data(state):
     inc, act = fetch_guests()
     if state.selected_lounge_filter != "All":
-        act = act[act['lounge_ui'] == state.selected_lounge_filter]
+        act = act[act['lounge_ui'] == state.selected_lounge_filter].reset_index(drop=True)
     
     state.incoming_guests = inc
     state.active_guests = act
@@ -198,6 +214,8 @@ def add_new_guest(state):
         "guest_name": state.new_guest_name,
         "session_type": state.new_guest_session,
         "is_active": False,
+        "has_left_kaveri": False,
+        "jai_gurudev": False,
         "lounge": "reception"
     }
     supabase.table('guests').insert(data).execute()
@@ -207,21 +225,25 @@ def add_new_guest(state):
 
 def select_incoming(state, id, payload):
     index = payload["index"]
-    row = state.incoming_guests.iloc[index]
-    state.selected_incoming_index = index
-    state.checkin_guest_id = str(row['id'])
-    state.checkin_guest_name = row['guest_name']
-    state.checkin_lounge = "Unassigned"
+    if index < len(state.incoming_guests):
+        row = state.incoming_guests.iloc[index]
+        state.selected_incoming_index = index
+        state.checkin_guest_id = str(row['id']) if 'id' in row else ""
+        state.checkin_guest_name = row['guest_name']
+        state.checkin_lounge = "Unassigned"
 
 def scan_qr(state):
     if not state.camera_image:
-        notify(state, "error", "No image captured.")
+        notify(state, "error", "No image selected.")
         return
         
     try:
-        img_data = base64.b64decode(state.camera_image.split(",")[1])
-        np_arr = np.frombuffer(img_data, np.uint8)
-        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if os.path.exists(state.camera_image):
+            img = cv2.imread(state.camera_image)
+        else:
+            img_data = base64.b64decode(state.camera_image.split(",")[1])
+            np_arr = np.frombuffer(img_data, np.uint8)
+            img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         
         detector = cv2.QRCodeDetector()
         data, bbox, _ = detector.detectAndDecode(img)
@@ -229,7 +251,6 @@ def scan_qr(state):
         if data:
             state.qr_data = data
             notify(state, "success", f"QR Scanned: {data}")
-            # Logic to match QR data to guest goes here
         else:
             notify(state, "warning", "No QR code detected in image.")
     except Exception as e:
@@ -242,17 +263,22 @@ def check_in_guest(state):
         
     db_lounge = ZONES_UI_TO_DB.get(state.checkin_lounge, "reception")
     
-    # Update Supabase
     update_data = {
         "is_active": True,
         "lounge": db_lounge
     }
+    
+    photo_data_str = ""
     if state.camera_image:
-        update_data["photo_data"] = state.camera_image
+        if os.path.exists(state.camera_image):
+            with open(state.camera_image, "rb") as image_file:
+                photo_data_str = base64.b64encode(image_file.read()).decode('utf-8')
+        else:
+            photo_data_str = state.camera_image
+        update_data["photo_data"] = photo_data_str
 
     supabase.table('guests').update(update_data).eq('id', state.checkin_guest_id).execute()
     
-    # Alert Telegram
     send_telegram_alert(state.checkin_guest_name, state.checkin_guest_id, state.checkin_lounge, state.camera_image)
     
     notify(state, "success", f"{state.checkin_guest_name} checked in!")
@@ -269,7 +295,7 @@ def generate_pdf(state):
     pdf.cell(200, 10, txt=f"Kaveri GM - Daily Report ({datetime.now().strftime('%Y-%m-%d')})", ln=True, align='C')
     
     for _, row in act.iterrows():
-        txt = f"Name: {row['guest_name']} | Lounge: {row['lounge_ui']} | LMW: {row['lmw_status']} | Demo: {row['demo_status']} | Met: {row['met_gurudev']}"
+        txt = f"Name: {row['guest_name']} | Lounge: {row['lounge_ui']} | LMW: {row.get('lmw_status', 'Not yet')} | Demo: {row.get('demo_status', 'Not yet')} | Met: {row.get('met_gurudev', False)}"
         pdf.cell(200, 10, txt=txt, ln=True)
         
     output_path = "daily_report.pdf"
@@ -279,17 +305,19 @@ def generate_pdf(state):
 
 def select_active(state, id, payload):
     index = payload["index"]
-    row = state.active_guests.iloc[index]
-    state.active_guest_id = str(row['id'])
-    state.active_guest_name = row['guest_name']
-    state.active_lmw = row.get('lmw_status', 'Not yet')
-    state.active_demo = row.get('demo_status', 'Not yet')
-    state.active_ready = bool(row.get('ready_to_meet_gurudev', False))
-    state.active_met = bool(row.get('met_gurudev', False))
-    state.active_lounge = row.get('lounge_ui', 'Unassigned')
+    if index < len(state.active_guests):
+        row = state.active_guests.iloc[index]
+        state.active_guest_id = str(row['id']) if 'id' in row else ""
+        state.active_guest_name = row['guest_name']
+        state.active_lmw = row.get('lmw_status', 'Not yet')
+        state.active_demo = row.get('demo_status', 'Not yet')
+        state.active_ready = bool(row.get('ready_to_meet_gurudev', False))
+        state.active_met = bool(row.get('met_gurudev', False))
+        state.active_lounge = row.get('lounge_ui', 'Unassigned')
 
 def save_active_updates(state):
     if not state.active_guest_id:
+        notify(state, "warning", "No guest selected to update.")
         return
         
     db_lounge = ZONES_UI_TO_DB.get(state.active_lounge, "reception")
@@ -307,6 +335,7 @@ def save_active_updates(state):
 
 def complete_visit(state):
     if not state.active_guest_id:
+        notify(state, "warning", "No guest selected.")
         return
     supabase.table('guests').update({"jai_gurudev": True}).eq('id', state.active_guest_id).execute()
     notify(state, "info", "Visit completed.")
@@ -324,15 +353,11 @@ def generate_wa_link(state):
            f"LMW: {state.active_lmw}\n"
            f"Demo: {state.active_demo}")
     
-    # Taipy doesn't open URLs natively via python callbacks without a custom JS execution,
-    # but we can populate a link string for the user to click.
     notify(state, "info", f"https://wa.me/?text={requests.utils.quote(msg)}")
-
 
 # ==========================================
 # 6. TAIPY GUI MARKDOWN LAYOUT
 # ==========================================
-
 page_layout = """
 # 🏛️ Kaveri GM
 
@@ -356,13 +381,16 @@ page_layout = """
 
 <hr/>
 
-### Incoming Guests 
+### Incoming Guests
 *(Click a row to check-in)*
 <|{incoming_guests}|table|columns={incoming_table_cols}|on_action=select_incoming|>
 
 #### Check-in selected: **<|{checkin_guest_name}|text|>**
 <|layout|columns=1 1|
-<|{camera_image}|camera|>
+<|part|
+<|{camera_image}|file_selector|label=Upload / Take Photo|extensions=.jpg,.png,.jpeg|>
+<|{camera_image}|image|height=200px|>
+|>
 <|part|
 <|Scan QR (from camera)|button|on_action=scan_qr|>
 <|{qr_data}|text|>
