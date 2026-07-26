@@ -56,7 +56,11 @@ manager_password_input = ""
 is_manager_authenticated = False
 new_guest_name = ""
 new_guest_session = "General"
-incoming_guests = pd.DataFrame(columns=['guest_name', 'session_type', 'lounge_ui'])
+
+# Ensure all hidden columns exist even when empty to prevent silent UI crashes
+incoming_guests = pd.DataFrame(columns=['id', 'guest_name', 'session_type', 'lounge_ui'])
+active_guests = pd.DataFrame(columns=['id', 'guest_name', 'lounge_ui', 'lmw_status', 'demo_status', 'ready_to_meet_gurudev', 'met_gurudev', 'checkin_time'])
+
 selected_incoming_index = -1
 checkin_guest_name = "Select a guest to check-in"
 checkin_guest_id = ""
@@ -65,7 +69,6 @@ camera_image = ""
 qr_data = ""
 pdf_path = ""
 
-active_guests = pd.DataFrame(columns=['guest_name', 'checkin_time'])
 selected_lounge_filter = "All"
 search_query = ""
 filter_options = ["All"] + UI_OPTIONS
@@ -83,36 +86,47 @@ show_dialog = False
 # 4. ROBUST MULTI-USER REAL-TIME SYNC
 # ==========================================
 active_clients = set()
-clients_lock = threading.Lock()  # Protects the client registry
+clients_lock = threading.Lock()
 
-latest_inc = pd.DataFrame()
-latest_act = pd.DataFrame()
-last_data_hash = ""
-data_lock = threading.Lock()  # Protects the global dataframe state
+latest_inc = incoming_guests.copy()
+latest_act = active_guests.copy()
+last_raw_data_hash = ""
+data_lock = threading.Lock()
 
-def fetch_guests():
-    """Queries DB and structures data safely."""
+def fetch_raw_supabase_data():
+    """Fetches raw data separated cleanly to catch older active guests."""
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    response = supabase.table('guests').select('*').gte('created_at', today).execute()
     
-    df = pd.DataFrame(response.data)
-    if df.empty:
-        return pd.DataFrame(columns=['guest_name', 'session_type', 'lounge_ui']), pd.DataFrame(columns=['guest_name', 'checkin_time'])
+    # Incoming: Must be created today
+    res_inc = supabase.table('guests').select('*').eq('is_active', False).eq('has_left_kaveri', False).gte('created_at', today).execute()
     
-    df['is_active'] = df['is_active'].fillna(False)
-    df['has_left_kaveri'] = df['has_left_kaveri'].fillna(False)
-    df['jai_gurudev'] = df['jai_gurudev'].fillna(False)
-    df['lounge_ui'] = df['lounge'].map(ZONES_DB_TO_UI).fillna("Unassigned")
-    df['checkin_time'] = (pd.to_datetime(df['created_at']) + pd.Timedelta(hours=5, minutes=30)).dt.strftime('%H:%M')
+    # Active: ANY day, as long as they are active and haven't completed their visit
+    res_act = supabase.table('guests').select('*').eq('is_active', True).eq('jai_gurudev', False).execute()
     
-    inc = df[(df['is_active'] == False) & (df['has_left_kaveri'] == False)].reset_index(drop=True)
-    act = df[(df['is_active'] == True) & (df['jai_gurudev'] == False)].reset_index(drop=True)
-    return inc, act
+    return res_inc.data, res_act.data
+
+def process_raw_data(inc_data, act_data):
+    """Safely formats DB data into DataFrames, converting timezones to IST."""
+    inc_df = pd.DataFrame(inc_data)
+    act_df = pd.DataFrame(act_data)
+    
+    if not inc_df.empty:
+        inc_df['lounge_ui'] = inc_df['lounge'].map(ZONES_DB_TO_UI).fillna("Unassigned")
+    else:
+        inc_df = pd.DataFrame(columns=['id', 'guest_name', 'session_type', 'lounge_ui'])
+        
+    if not act_df.empty:
+        act_df['lounge_ui'] = act_df['lounge'].map(ZONES_DB_TO_UI).fillna("Unassigned")
+        # Ensure UTC timezone conversion to IST safely
+        act_df['checkin_time'] = pd.to_datetime(act_df['created_at'], utc=True).dt.tz_convert('Asia/Kolkata').dt.strftime('%H:%M')
+    else:
+        act_df = pd.DataFrame(columns=['id', 'guest_name', 'lounge_ui', 'lmw_status', 'demo_status', 'ready_to_meet_gurudev', 'met_gurudev', 'checkin_time'])
+        
+    return inc_df, act_df
 
 def broadcast_update():
-    """Safely pushes the latest global data to all active devices instantly."""
+    """Pushes fresh state to all active browsers."""
     with clients_lock:
-        # Snapshot clients to avoid runtime iteration errors during rapid connections
         clients_snapshot = list(active_clients)
         
     dead_clients = set()
@@ -127,51 +141,61 @@ def broadcast_update():
             active_clients.difference_update(dead_clients)
 
 def force_sync():
-    """Fetches DB data, updates global locked state, and broadcasts."""
-    global latest_inc, latest_act, last_data_hash
-    inc, act = fetch_guests()
-    current_hash = hash(inc.to_csv() + act.to_csv())
+    """Forces an immediate DB fetch and broadcast (bypasses the 2s timer)."""
+    global latest_inc, latest_act, last_raw_data_hash
+    inc_data, act_data = fetch_raw_supabase_data()
+    current_hash = hash(str(inc_data) + str(act_data))
+    
+    inc_df, act_df = process_raw_data(inc_data, act_data)
     
     with data_lock:
-        latest_inc = inc
-        latest_act = act
-        last_data_hash = current_hash
+        latest_inc = inc_df
+        latest_act = act_df
+        last_raw_data_hash = current_hash
         
     broadcast_update()
 
 def global_db_watcher():
-    """Background thread polling for manual DB edits."""
-    global latest_inc, latest_act, last_data_hash
+    """Infinite loop watching Supabase for manual edits."""
+    global latest_inc, latest_act, last_raw_data_hash
     while True:
-        time.sleep(2.5) 
         try:
-            inc, act = fetch_guests()
-            current_hash = hash(inc.to_csv() + act.to_csv())
+            inc_data, act_data = fetch_raw_supabase_data()
             
-            # Only trigger broadcast if the DB actually changed
-            if current_hash != last_data_hash:
+            # Hashing the RAW JSON instantly catches manual Supabase edits
+            current_hash = hash(str(inc_data) + str(act_data))
+            
+            if current_hash != last_raw_data_hash:
+                inc_df, act_df = process_raw_data(inc_data, act_data)
+                
                 with data_lock:
-                    latest_inc = inc
-                    latest_act = act
-                    last_data_hash = current_hash
+                    latest_inc = inc_df
+                    latest_act = act_df
+                    last_raw_data_hash = current_hash
+                    
                 broadcast_update()
         except Exception as e:
-            print(f"DB Watcher Error: {e}")
+            print(f"DB Watcher Error (Will retry): {e}")
+            
+        time.sleep(2) # Poll every 2 seconds
 
 def silent_refresh(state):
-    """Applies locked global data to the local client's state & active filters."""
+    """Applies global data to the specific user's UI."""
     with data_lock:
         inc = latest_inc.copy()
         act = latest_act.copy()
     
+    # Apply Client-Side Filters
     if state.selected_lounge_filter != "All":
         act = act[act['lounge_ui'] == state.selected_lounge_filter]
     if state.search_query.strip():
         act = act[act['guest_name'].str.contains(state.search_query.strip(), case=False, na=False)]
     
-    state.incoming_guests = inc.reset_index(drop=True)
-    state.active_guests = act.reset_index(drop=True)
+    # Assign copies to force Taipy to redraw the tables
+    state.incoming_guests = inc.reset_index(drop=True).copy()
+    state.active_guests = act.reset_index(drop=True).copy()
 
+    # Instant Dialog Sync
     if state.active_guest_id and state.show_dialog:
         current_guest = act[act['id'].astype(str) == state.active_guest_id]
         if not current_guest.empty:
@@ -292,7 +316,6 @@ def close_dialog(state):
     state.active_guest_id = ""
 
 def auto_save_active(state):
-    """Automatically commits updates to DB instantly on switch interaction."""
     if not state.active_guest_id:
         return
     db_lounge = ZONES_UI_TO_DB.get(state.active_lounge, "reception")
@@ -420,7 +443,11 @@ page_layout = """
 if __name__ == "__main__":
     gui = Gui(page=page_layout)
     force_sync()
-    threading.Thread(target=global_db_watcher, daemon=True).start()
+    
+    # Start the indestructible DB polling thread
+    watcher_thread = threading.Thread(target=global_db_watcher, daemon=True)
+    watcher_thread.start()
+    
     gui.run(
         host="0.0.0.0",
         port=PORT,
