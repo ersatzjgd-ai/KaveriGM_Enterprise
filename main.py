@@ -44,8 +44,6 @@ SESSION_OPTIONS = ["VIP", "General", "Group", "Special Session"]
 STATUS_OPTIONS = ["Not yet", "Started", "Done"]
 
 incoming_table_cols = {"guest_name": {"title": "Name"}, "session_type": {"title": "Session"}, "lounge_ui": {"title": "Lounge"}}
-
-# Refined active columns: Only Name and Time
 active_table_cols = {"guest_name": {"title": "Name"}, "checkin_time": {"title": "Check-in Time"}}
 
 # ==========================================
@@ -79,17 +77,18 @@ active_demo = "Not yet"
 active_ready = False
 active_met = False
 active_lounge = "Unassigned"
-
-# Dialog State
 show_dialog = False
 
 # ==========================================
-# 4. GLOBAL REAL-TIME SYNC REGISTRY
+# 4. ROBUST MULTI-USER REAL-TIME SYNC
 # ==========================================
 active_clients = set()
+clients_lock = threading.Lock()  # Protects the client registry
+
 latest_inc = pd.DataFrame()
 latest_act = pd.DataFrame()
 last_data_hash = ""
+data_lock = threading.Lock()  # Protects the global dataframe state
 
 def fetch_guests():
     """Queries DB and structures data safely."""
@@ -104,8 +103,6 @@ def fetch_guests():
     df['has_left_kaveri'] = df['has_left_kaveri'].fillna(False)
     df['jai_gurudev'] = df['jai_gurudev'].fillna(False)
     df['lounge_ui'] = df['lounge'].map(ZONES_DB_TO_UI).fillna("Unassigned")
-    
-    # Format Check-in time to IST (UTC + 5:30) HH:MM safely
     df['checkin_time'] = (pd.to_datetime(df['created_at']) + pd.Timedelta(hours=5, minutes=30)).dt.strftime('%H:%M')
     
     inc = df[(df['is_active'] == False) & (df['has_left_kaveri'] == False)].reset_index(drop=True)
@@ -113,44 +110,59 @@ def fetch_guests():
     return inc, act
 
 def broadcast_update():
-    """Pushes the latest global data to ALL connected devices instantly."""
+    """Safely pushes the latest global data to all active devices instantly."""
+    with clients_lock:
+        # Snapshot clients to avoid runtime iteration errors during rapid connections
+        clients_snapshot = list(active_clients)
+        
     dead_clients = set()
-    for client_id in active_clients:
+    for client_id in clients_snapshot:
         try:
             invoke_callback(gui, client_id, silent_refresh)
         except Exception:
             dead_clients.add(client_id)
-    active_clients.difference_update(dead_clients)
+            
+    if dead_clients:
+        with clients_lock:
+            active_clients.difference_update(dead_clients)
 
 def force_sync():
-    """Forces a DB fetch and triggers a global broadcast."""
+    """Fetches DB data, updates global locked state, and broadcasts."""
     global latest_inc, latest_act, last_data_hash
     inc, act = fetch_guests()
-    latest_inc = inc
-    latest_act = act
-    last_data_hash = hash(inc.to_csv() + act.to_csv())
+    current_hash = hash(inc.to_csv() + act.to_csv())
+    
+    with data_lock:
+        latest_inc = inc
+        latest_act = act
+        last_data_hash = current_hash
+        
     broadcast_update()
 
 def global_db_watcher():
-    """Background thread polling Supabase for manual DB edits."""
+    """Background thread polling for manual DB edits."""
     global latest_inc, latest_act, last_data_hash
     while True:
         time.sleep(2.5) 
         try:
             inc, act = fetch_guests()
             current_hash = hash(inc.to_csv() + act.to_csv())
+            
+            # Only trigger broadcast if the DB actually changed
             if current_hash != last_data_hash:
-                latest_inc = inc
-                latest_act = act
-                last_data_hash = current_hash
+                with data_lock:
+                    latest_inc = inc
+                    latest_act = act
+                    last_data_hash = current_hash
                 broadcast_update()
         except Exception as e:
             print(f"DB Watcher Error: {e}")
 
 def silent_refresh(state):
-    """Applies global data to the local client's state & active filters."""
-    inc = latest_inc.copy()
-    act = latest_act.copy()
+    """Applies locked global data to the local client's state & active filters."""
+    with data_lock:
+        inc = latest_inc.copy()
+        act = latest_act.copy()
     
     if state.selected_lounge_filter != "All":
         act = act[act['lounge_ui'] == state.selected_lounge_filter]
@@ -178,7 +190,8 @@ def silent_refresh(state):
 # ==========================================
 def on_init(state):
     client_id = get_state_id(state)
-    active_clients.add(client_id)
+    with clients_lock:
+        active_clients.add(client_id)
     silent_refresh(state)
 
 def on_filter_change(state):
@@ -253,7 +266,9 @@ def generate_pdf(state):
     pdf.add_page()
     pdf.set_font("Arial", size=12)
     pdf.cell(200, 10, txt=f"Kaveri GM - Daily Report ({datetime.now().strftime('%Y-%m-%d')})", ln=True, align='C')
-    for _, row in latest_act.iterrows():
+    with data_lock:
+        local_act = latest_act.copy()
+    for _, row in local_act.iterrows():
         pdf.cell(200, 10, txt=f"Name: {row['guest_name']} | Lounge: {row['lounge_ui']} | LMW: {row.get('lmw_status', 'Not yet')} | Met: {row.get('met_gurudev', False)}", ln=True)
     pdf.output("daily_report.pdf")
     state.pdf_path = "daily_report.pdf"
@@ -270,7 +285,6 @@ def select_active(state, id, payload):
         state.active_ready = bool(row.get('ready_to_meet_gurudev', False))
         state.active_met = bool(row.get('met_gurudev', False))
         state.active_lounge = row.get('lounge_ui', 'Unassigned')
-        # Open Dialog Card
         state.show_dialog = True
 
 def close_dialog(state):
@@ -278,7 +292,7 @@ def close_dialog(state):
     state.active_guest_id = ""
 
 def auto_save_active(state):
-    """Automatically commits updates to DB without needing a Save button."""
+    """Automatically commits updates to DB instantly on switch interaction."""
     if not state.active_guest_id:
         return
     db_lounge = ZONES_UI_TO_DB.get(state.active_lounge, "reception")
@@ -355,8 +369,6 @@ page_layout = """
 |>
 
 <|part|render={current_role == "On-Ground Team 🏃"}|
-## On-Ground Portal
-
 <br/>
 <|{selected_lounge_filter}|toggle|lov={filter_options}|on_change=on_filter_change|>
 
