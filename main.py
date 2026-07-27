@@ -57,7 +57,6 @@ is_manager_authenticated = False
 new_guest_name = ""
 new_guest_session = "General"
 
-# Ensure all hidden columns exist even when empty to prevent silent UI crashes
 incoming_guests = pd.DataFrame(columns=['id', 'guest_name', 'session_type', 'lounge_ui'])
 active_guests = pd.DataFrame(columns=['id', 'guest_name', 'lounge_ui', 'lmw_status', 'demo_status', 'ready_to_meet_gurudev', 'met_gurudev', 'checkin_time'])
 
@@ -80,10 +79,11 @@ active_demo = "Not yet"
 active_ready = False
 active_met = False
 active_lounge = "Unassigned"
+new_reassign_lounge = "Unassigned"  # Dedicated variable for lounge reassignment
 show_dialog = False
 
 # ==========================================
-# 4. ROBUST MULTI-USER REAL-TIME SYNC
+# 4. ROBUST MULTI-USER REAL-TIME SYNC & WEBSOCKETS
 # ==========================================
 active_clients = set()
 clients_lock = threading.Lock()
@@ -96,13 +96,8 @@ data_lock = threading.Lock()
 def fetch_raw_supabase_data():
     """Fetches raw data separated cleanly to catch older active guests."""
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    
-    # Incoming: Must be created today
     res_inc = supabase.table('guests').select('*').eq('is_active', False).eq('has_left_kaveri', False).gte('created_at', today).execute()
-    
-    # Active: ANY day, as long as they are active and haven't completed their visit
     res_act = supabase.table('guests').select('*').eq('is_active', True).eq('jai_gurudev', False).execute()
-    
     return res_inc.data, res_act.data
 
 def process_raw_data(inc_data, act_data):
@@ -117,7 +112,6 @@ def process_raw_data(inc_data, act_data):
         
     if not act_df.empty:
         act_df['lounge_ui'] = act_df['lounge'].map(ZONES_DB_TO_UI).fillna("Unassigned")
-        # Ensure UTC timezone conversion to IST safely
         act_df['checkin_time'] = pd.to_datetime(act_df['created_at'], utc=True).dt.tz_convert('Asia/Kolkata').dt.strftime('%H:%M')
     else:
         act_df = pd.DataFrame(columns=['id', 'guest_name', 'lounge_ui', 'lmw_status', 'demo_status', 'ready_to_meet_gurudev', 'met_gurudev', 'checkin_time'])
@@ -141,7 +135,7 @@ def broadcast_update():
             active_clients.difference_update(dead_clients)
 
 def force_sync():
-    """Forces an immediate DB fetch and broadcast (bypasses the 2s timer)."""
+    """Forces an immediate DB fetch and broadcast."""
     global latest_inc, latest_act, last_raw_data_hash
     inc_data, act_data = fetch_raw_supabase_data()
     current_hash = hash(str(inc_data) + str(act_data))
@@ -156,25 +150,18 @@ def force_sync():
     broadcast_update()
 
 def handle_realtime_update(payload):
-    """Callback triggered instantly by Supabase when a DB row changes."""
-    # payload contains the exact data that changed, but to keep our global 
-    # filters and UI perfectly in sync, we just tell the app to pull the fresh state.
+    """Callback triggered instantly by Supabase WebSockets when a DB row changes."""
     force_sync()
 
 def global_db_watcher():
-    """Listens to Supabase Realtime WebSockets instead of polling."""
+    """Listens to Supabase Realtime WebSockets."""
     print("Initiating Supabase WebSocket connection...")
     try:
-        # Subscribe to all INSERT, UPDATE, and DELETE events on the 'guests' table
         supabase.table('guests').on('*', handle_realtime_update).subscribe()
-        
-        # Keep the background thread alive so the WebSocket stays open
         while True:
             time.sleep(60) 
-            
     except Exception as e:
         print(f"WebSocket Connection Error: {e}")
-        # If you wanted to be hyper-resilient, you could trigger a fallback polling loop here
 
 def silent_refresh(state):
     """Applies global data to the specific user's UI."""
@@ -182,17 +169,14 @@ def silent_refresh(state):
         inc = latest_inc.copy()
         act = latest_act.copy()
     
-    # Apply Client-Side Filters
     if state.selected_lounge_filter != "All":
         act = act[act['lounge_ui'] == state.selected_lounge_filter]
     if state.search_query.strip():
         act = act[act['guest_name'].str.contains(state.search_query.strip(), case=False, na=False)]
     
-    # Assign copies to force Taipy to redraw the tables
     state.incoming_guests = inc.reset_index(drop=True).copy()
     state.active_guests = act.reset_index(drop=True).copy()
 
-    # Instant Dialog Sync
     if state.active_guest_id and state.show_dialog:
         current_guest = act[act['id'].astype(str) == state.active_guest_id]
         if not current_guest.empty:
@@ -306,6 +290,7 @@ def select_active(state, id, payload):
         state.active_ready = bool(row.get('ready_to_meet_gurudev', False))
         state.active_met = bool(row.get('met_gurudev', False))
         state.active_lounge = row.get('lounge_ui', 'Unassigned')
+        state.new_reassign_lounge = state.active_lounge
         state.show_dialog = True
 
 def close_dialog(state):
@@ -313,6 +298,7 @@ def close_dialog(state):
     state.active_guest_id = ""
 
 def auto_save_active(state):
+    """Automatically commits non-lounge updates to DB instantly."""
     if not state.active_guest_id:
         return
     db_lounge = ZONES_UI_TO_DB.get(state.active_lounge, "reception")
@@ -320,6 +306,16 @@ def auto_save_active(state):
     supabase.table('guests').update(data).eq('id', state.active_guest_id).execute()
     force_sync() 
     notify(state, "success", "Saved.")
+
+def reassign_guest_lounge(state):
+    """Explicitly updates the lounge location from the bottom section of the dialog."""
+    if not state.active_guest_id:
+        return
+    db_lounge = ZONES_UI_TO_DB.get(state.new_reassign_lounge, "reception")
+    supabase.table('guests').update({"lounge": db_lounge}).eq('id', state.active_guest_id).execute()
+    state.active_lounge = state.new_reassign_lounge
+    force_sync()
+    notify(state, "success", f"Lounge updated to {state.new_reassign_lounge}!")
 
 def complete_visit(state):
     if not state.active_guest_id:
@@ -399,10 +395,12 @@ page_layout = """
 *(Click a row below to open their management card)*
 <|{active_guests}|table|columns={active_table_cols}|on_action=select_active|>
 
-<|{show_dialog}|dialog|title=👤 {active_guest_name}|labels=Close|on_action=close_dialog|
+<|{show_dialog}|dialog|title=👤 {active_guest_name}  |  📍 Location: {active_lounge}|labels=Close|on_action=close_dialog|
 
 <|layout|columns=1 1|
-<|{active_lounge}|selector|lov={UI_OPTIONS}|dropdown=True|label=Lounge|on_change=auto_save_active|>
+<|part|
+**Current Lounge Indicator:** <|{active_lounge}|text|>
+|>
 <|📸 Photo|button|>
 |>
 
@@ -425,6 +423,14 @@ page_layout = """
 |>
 
 <br/>
+<hr/>
+**🔄 Reassign Lounge Location**
+<|layout|columns=2 1|
+<|{new_reassign_lounge}|selector|lov={UI_OPTIONS}|dropdown=True|label=Select New Lounge|>
+<|Update Lounge|button|on_action=reassign_guest_lounge|>
+|>
+
+<br/>
 <|layout|columns=1 1|
 <|📱 WhatsApp|button|on_action=generate_wa_link|>
 <|✅ Complete|button|on_action=complete_visit|>
@@ -441,7 +447,6 @@ if __name__ == "__main__":
     gui = Gui(page=page_layout)
     force_sync()
     
-    # Start the indestructible DB polling thread
     watcher_thread = threading.Thread(target=global_db_watcher, daemon=True)
     watcher_thread.start()
     
