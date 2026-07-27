@@ -79,8 +79,9 @@ active_demo = "Not yet"
 active_ready = False
 active_met = False
 active_lounge = "Unassigned"
-new_reassign_lounge = "Unassigned"  # Dedicated variable for lounge reassignment
+new_reassign_lounge = "Unassigned"
 show_dialog = False
+dialog_title = ""  # Explicit python string for dialog title
 
 # ==========================================
 # 4. ROBUST MULTI-USER REAL-TIME SYNC & WEBSOCKETS
@@ -185,7 +186,11 @@ def silent_refresh(state):
             state.active_demo = row.get('demo_status', 'Not yet')
             state.active_ready = bool(row.get('ready_to_meet_gurudev', False))
             state.active_met = bool(row.get('met_gurudev', False))
-            state.active_lounge = row.get('lounge_ui', 'Unassigned')
+            
+            # Update the dialog title dynamically if lounge was updated remotely
+            new_lounge = row.get('lounge_ui', 'Unassigned')
+            state.active_lounge = new_lounge
+            state.dialog_title = f"👤 {state.active_guest_name} | 📍 {new_lounge}"
         else:
             state.show_dialog = False
             state.active_guest_id = ""
@@ -291,6 +296,9 @@ def select_active(state, id, payload):
         state.active_met = bool(row.get('met_gurudev', False))
         state.active_lounge = row.get('lounge_ui', 'Unassigned')
         state.new_reassign_lounge = state.active_lounge
+        
+        # Explicitly format the dialog title
+        state.dialog_title = f"👤 {state.active_guest_name} | 📍 {state.active_lounge}"
         state.show_dialog = True
 
 def close_dialog(state):
@@ -313,7 +321,10 @@ def reassign_guest_lounge(state):
         return
     db_lounge = ZONES_UI_TO_DB.get(state.new_reassign_lounge, "reception")
     supabase.table('guests').update({"lounge": db_lounge}).eq('id', state.active_guest_id).execute()
+    
     state.active_lounge = state.new_reassign_lounge
+    state.dialog_title = f"👤 {state.active_guest_name} | 📍 {state.active_lounge}"
+    
     force_sync()
     notify(state, "success", f"Lounge updated to {state.new_reassign_lounge}!")
 
@@ -395,14 +406,7 @@ page_layout = """
 *(Click a row below to open their management card)*
 <|{active_guests}|table|columns={active_table_cols}|on_action=select_active|>
 
-<|{show_dialog}|dialog|title=👤 {active_guest_name}  |  📍 Location: {active_lounge}|labels=Close|on_action=close_dialog|
-
-<|layout|columns=1 1|
-<|part|
-**Current Lounge Indicator:** <|{active_lounge}|text|>
-|>
-<|📸 Photo|button|>
-|>
+<|{show_dialog}|dialog|title={dialog_title}|labels=Close|on_action=close_dialog|
 
 <br/>
 <|layout|columns=1 1|
@@ -423,20 +427,20 @@ page_layout = """
 |>
 
 <br/>
-<hr/>
-**🔄 Reassign Lounge Location**
-<|layout|columns=2 1|
-<|{new_reassign_lounge}|selector|lov={UI_OPTIONS}|dropdown=True|label=Select New Lounge|>
-<|Update Lounge|button|on_action=reassign_guest_lounge|>
-|>
-
-<br/>
 <|layout|columns=1 1|
 <|📱 WhatsApp|button|on_action=generate_wa_link|>
 <|✅ Complete|button|on_action=complete_visit|>
 |>
+
+<br/>
+<hr/>
+**🔄 Reassign Lounge Location**
+<|layout|columns=3 1|
+<|{new_reassign_lounge}|selector|lov={UI_OPTIONS}|dropdown=True|>
+<|Update|button|on_action=reassign_guest_lounge|>
 |>
 
+|>
 |>
 """
 
