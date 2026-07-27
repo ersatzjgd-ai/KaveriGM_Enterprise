@@ -155,29 +155,26 @@ def force_sync():
         
     broadcast_update()
 
+def handle_realtime_update(payload):
+    """Callback triggered instantly by Supabase when a DB row changes."""
+    # payload contains the exact data that changed, but to keep our global 
+    # filters and UI perfectly in sync, we just tell the app to pull the fresh state.
+    force_sync()
+
 def global_db_watcher():
-    """Infinite loop watching Supabase for manual edits."""
-    global latest_inc, latest_act, last_raw_data_hash
-    while True:
-        try:
-            inc_data, act_data = fetch_raw_supabase_data()
+    """Listens to Supabase Realtime WebSockets instead of polling."""
+    print("Initiating Supabase WebSocket connection...")
+    try:
+        # Subscribe to all INSERT, UPDATE, and DELETE events on the 'guests' table
+        supabase.table('guests').on('*', handle_realtime_update).subscribe()
+        
+        # Keep the background thread alive so the WebSocket stays open
+        while True:
+            time.sleep(60) 
             
-            # Hashing the RAW JSON instantly catches manual Supabase edits
-            current_hash = hash(str(inc_data) + str(act_data))
-            
-            if current_hash != last_raw_data_hash:
-                inc_df, act_df = process_raw_data(inc_data, act_data)
-                
-                with data_lock:
-                    latest_inc = inc_df
-                    latest_act = act_df
-                    last_raw_data_hash = current_hash
-                    
-                broadcast_update()
-        except Exception as e:
-            print(f"DB Watcher Error (Will retry): {e}")
-            
-        time.sleep(2) # Poll every 2 seconds
+    except Exception as e:
+        print(f"WebSocket Connection Error: {e}")
+        # If you wanted to be hyper-resilient, you could trigger a fallback polling loop here
 
 def silent_refresh(state):
     """Applies global data to the specific user's UI."""
