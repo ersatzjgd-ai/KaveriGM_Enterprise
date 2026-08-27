@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from fpdf import FPDF
-from taipy.gui import Gui, State, notify, get_state_id, invoke_callback
+from taipy.gui import Gui, State, notify, get_state_id, invoke_callback, navigate
 
 # ==========================================
 # 1. ENVIRONMENT SETUP & CONFIGURATION
@@ -81,7 +81,7 @@ active_met = False
 active_lounge = "Unassigned"
 new_reassign_lounge = "Unassigned"
 show_dialog = False
-dialog_title = ""  # Explicit python string for dialog title
+dialog_title = ""  
 
 # ==========================================
 # 4. ROBUST MULTI-USER REAL-TIME SYNC & WEBSOCKETS
@@ -95,14 +95,12 @@ last_raw_data_hash = ""
 data_lock = threading.Lock()
 
 def fetch_raw_supabase_data():
-    """Fetches raw data separated cleanly to catch older active guests."""
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     res_inc = supabase.table('guests').select('*').eq('is_active', False).eq('has_left_kaveri', False).gte('created_at', today).execute()
     res_act = supabase.table('guests').select('*').eq('is_active', True).eq('jai_gurudev', False).execute()
     return res_inc.data, res_act.data
 
 def process_raw_data(inc_data, act_data):
-    """Safely formats DB data into DataFrames, converting timezones to IST."""
     inc_df = pd.DataFrame(inc_data)
     act_df = pd.DataFrame(act_data)
     
@@ -120,7 +118,6 @@ def process_raw_data(inc_data, act_data):
     return inc_df, act_df
 
 def broadcast_update():
-    """Pushes fresh state to all active browsers."""
     with clients_lock:
         clients_snapshot = list(active_clients)
         
@@ -136,7 +133,6 @@ def broadcast_update():
             active_clients.difference_update(dead_clients)
 
 def force_sync():
-    """Forces an immediate DB fetch and broadcast."""
     global latest_inc, latest_act, last_raw_data_hash
     inc_data, act_data = fetch_raw_supabase_data()
     current_hash = hash(str(inc_data) + str(act_data))
@@ -151,11 +147,9 @@ def force_sync():
     broadcast_update()
 
 def handle_realtime_update(payload):
-    """Callback triggered instantly by Supabase WebSockets when a DB row changes."""
     force_sync()
 
 def global_db_watcher():
-    """Listens to Supabase Realtime WebSockets."""
     print("Initiating Supabase WebSocket connection...")
     try:
         supabase.table('guests').on('*', handle_realtime_update).subscribe()
@@ -165,7 +159,6 @@ def global_db_watcher():
         print(f"WebSocket Connection Error: {e}")
 
 def silent_refresh(state):
-    """Applies global data to the specific user's UI."""
     with data_lock:
         inc = latest_inc.copy()
         act = latest_act.copy()
@@ -187,7 +180,6 @@ def silent_refresh(state):
             state.active_ready = bool(row.get('ready_to_meet_gurudev', False))
             state.active_met = bool(row.get('met_gurudev', False))
             
-            # Update the dialog title dynamically if lounge was updated remotely
             new_lounge = row.get('lounge_ui', 'Unassigned')
             state.active_lounge = new_lounge
             state.dialog_title = f"👤 {state.active_guest_name} | 📍 {new_lounge}"
@@ -297,7 +289,6 @@ def select_active(state, id, payload):
         state.active_lounge = row.get('lounge_ui', 'Unassigned')
         state.new_reassign_lounge = state.active_lounge
         
-        # Explicitly format the dialog title
         state.dialog_title = f"👤 {state.active_guest_name} | 📍 {state.active_lounge}"
         state.show_dialog = True
 
@@ -306,14 +297,9 @@ def close_dialog(state):
     state.active_guest_id = ""
 
 def auto_save_active(state):
-    """Saves toggles instantly without freezing the UI thread."""
     if not state.active_guest_id:
         return
-    
-    # 1. Show notification instantly
     notify(state, "success", "Saved.")
-
-    # 2. Write to DB (Supabase WebSockets automatically notify other devices in background)
     db_lounge = ZONES_UI_TO_DB.get(state.active_lounge, "reception")
     data = {
         "lmw_status": state.active_lmw, 
@@ -325,34 +311,42 @@ def auto_save_active(state):
     supabase.table('guests').update(data).eq('id', state.active_guest_id).execute()
 
 def reassign_guest_lounge(state):
-    """Updates lounge location with zero UI lag."""
     if not state.active_guest_id:
         return
-        
-    # 1. Update UI state and notify instantly
     state.active_lounge = state.new_reassign_lounge
     state.dialog_title = f"👤 {state.active_guest_name} | 📍 {state.active_lounge}"
     notify(state, "success", f"Lounge updated to {state.new_reassign_lounge}!")
-
-    # 2. Send DB update asynchronously
     db_lounge = ZONES_UI_TO_DB.get(state.new_reassign_lounge, "reception")
     supabase.table('guests').update({"lounge": db_lounge}).eq('id', state.active_guest_id).execute()
 
 def complete_visit(state):
     if not state.active_guest_id:
         return
-    supabase.table('guests').update({"jai_gurudev": True}).eq('id', state.active_guest_id).execute()
+        
+    guest_id_to_remove = str(state.active_guest_id)
+    
+    # 1. Update database first
+    supabase.table('guests').update({"jai_gurudev": True}).eq('id', guest_id_to_remove).execute()
+    
+    # 2. Close dialog & notify instantly
     state.show_dialog = False
-    state.active_guest_id = ""
-    force_sync() 
     notify(state, "info", "Visit completed.")
+    state.active_guest_id = ""
+    
+    # 3. Instantly filter the guest out of the local DataFrame to fix UI lag
+    temp_df = state.active_guests.copy()
+    temp_df = temp_df[temp_df['id'].astype(str) != guest_id_to_remove]
+    state.active_guests = temp_df
+    
+    # 4. Sync global state for other users in the background
+    force_sync() 
 
 def generate_wa_link(state):
     if state.active_guest_id:
         msg = f"Status Update: {state.active_guest_name}\nLounge: {state.active_lounge}\nLMW: {state.active_lmw}\nDemo: {state.active_demo}"
         url = f"https://wa.me/?text={requests.utils.quote(msg)}"
         
-        # Navigate directly opens the URL
+        # Opens WhatsApp in browser via navigate() instead of notify()
         navigate(state, url)
 
 # ==========================================
