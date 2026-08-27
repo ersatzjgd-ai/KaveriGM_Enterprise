@@ -350,7 +350,10 @@ def complete_visit(state):
 def generate_wa_link(state):
     if state.active_guest_id:
         msg = f"Status Update: {state.active_guest_name}\nLounge: {state.active_lounge}\nLMW: {state.active_lmw}\nDemo: {state.active_demo}"
-        notify(state, "info", f"https://wa.me/?text={requests.utils.quote(msg)}")
+        url = f"https://wa.me/?text={requests.utils.quote(msg)}"
+        
+        # Navigate directly opens the URL
+        navigate(state, url)
 
 # ==========================================
 # 6. TAIPY GUI MARKDOWN LAYOUT
