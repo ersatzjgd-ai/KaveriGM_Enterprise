@@ -306,27 +306,37 @@ def close_dialog(state):
     state.active_guest_id = ""
 
 def auto_save_active(state):
-    """Automatically commits non-lounge updates to DB instantly."""
+    """Saves toggles instantly without freezing the UI thread."""
     if not state.active_guest_id:
         return
-    db_lounge = ZONES_UI_TO_DB.get(state.active_lounge, "reception")
-    data = {"lmw_status": state.active_lmw, "demo_status": state.active_demo, "ready_to_meet_gurudev": state.active_ready, "met_gurudev": state.active_met, "lounge": db_lounge}
-    supabase.table('guests').update(data).eq('id', state.active_guest_id).execute()
-    force_sync() 
+    
+    # 1. Show notification instantly
     notify(state, "success", "Saved.")
 
+    # 2. Write to DB (Supabase WebSockets automatically notify other devices in background)
+    db_lounge = ZONES_UI_TO_DB.get(state.active_lounge, "reception")
+    data = {
+        "lmw_status": state.active_lmw, 
+        "demo_status": state.active_demo, 
+        "ready_to_meet_gurudev": state.active_ready, 
+        "met_gurudev": state.active_met, 
+        "lounge": db_lounge
+    }
+    supabase.table('guests').update(data).eq('id', state.active_guest_id).execute()
+
 def reassign_guest_lounge(state):
-    """Explicitly updates the lounge location from the bottom section of the dialog."""
+    """Updates lounge location with zero UI lag."""
     if not state.active_guest_id:
         return
-    db_lounge = ZONES_UI_TO_DB.get(state.new_reassign_lounge, "reception")
-    supabase.table('guests').update({"lounge": db_lounge}).eq('id', state.active_guest_id).execute()
-    
+        
+    # 1. Update UI state and notify instantly
     state.active_lounge = state.new_reassign_lounge
     state.dialog_title = f"👤 {state.active_guest_name} | 📍 {state.active_lounge}"
-    
-    force_sync()
     notify(state, "success", f"Lounge updated to {state.new_reassign_lounge}!")
+
+    # 2. Send DB update asynchronously
+    db_lounge = ZONES_UI_TO_DB.get(state.new_reassign_lounge, "reception")
+    supabase.table('guests').update({"lounge": db_lounge}).eq('id', state.active_guest_id).execute()
 
 def complete_visit(state):
     if not state.active_guest_id:
